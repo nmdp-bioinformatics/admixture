@@ -1,114 +1,246 @@
+#!/usr/bin/env python3
+"""
+NMF for haplotype frequency files in your format.
+
+Input: directory containing files like:
+  freqs.CY.csv
+  freqs.IL-LIBYA.csv
+  freqs.US-NAFR.csv  (or freqs.US-NAFR.cav, etc.)
+
+Each file must contain: Haplo,Count,Freq  (extra cols allowed)
+
+We build X (populations x haplotypes) using Freq (default) or Count.
+Then run NMF: X ~= W @ H
+- W: (n_pops x K) mixture proportions for each original population
+- H: (K x n_haplos) component haplotype profiles ("new K populations")
+
+Outputs (in --out-dir):
+  W.populations_by_K.csv
+  H.K_by_haplotypes.csv
+  components.top_haplotypes.csv
+  matrix.X.shape.txt
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 import numpy as np
-import matplotlib.pyplot as plt
-import scipy.sparse as spr
-from numpy import genfromtxt
+import pandas as pd
 from sklearn.decomposition import NMF
-from sklearn.cluster import KMeans
-from matplotlib.pyplot import figure
-import nimfa
-import csv
-import copy
+from sklearn.preprocessing import normalize
 
 
-fname='new_nn_Freqs_matrix_Pop56_5Locus_15082017.csv'
-fname_pop_names='Pop_Name_5locus_56_15082017.csv'
-outfile='nmf.csv'
-
-def normalize_dat(haplotype_freq,method):
-    # normalization for the input
-    # 1 is to keep the full size
-    #2 is the square root
-    # 3 is fully normalized to 1
-    hap_freq_norm=copy.deepcopy(haplotype_freq)
-    sum_col=haplotype_freq.sum(axis=0)
-    if (method == 2):
-        sum_col=np.sqrt(sum_col);
-    if (method == 3):
-        sum_col=sum_col*0+1;
-    print(sum_col)
-    for col in range(haplotype_freq.shape[1]):
-        hap_freq_norm[:,col]=haplotype_freq[:,col]/sum_col[col]
-    return hap_freq_norm
-        
-def nmf_comp(Num_Comp,haplotype_freq,norm_method,comp_method='NIMFA'):
-    # run the nmf, we can use either nimfa or the sklearn nmf
-    # the output is a dictionary with W and H
-    hap_freq_norm=normalize_dat(haplotype_freq,norm_method)
-    if (comp_method=='NIMFA'):
-        nmf = nimfa.Nmf(hap_freq_norm, max_iter=200, rank=Num_Comp, update='euclidean', objective='fro')
-        nmf_fit = nmf()
-        W = nmf_fit.basis()
-        H = nmf_fit.coef()
-    if (comp_method=='NMF'):
-        model = NMF(n_components=Num_Comp, init='random', random_state=0,solver='cd')
-        W = model.fit_transform(hap_freq_norm)
-        H = model.components_
-    return {'W': W, 'H': H}
+def parse_key_from_filename(p: Path) -> str:
+    """
+    freqs.CY.csv -> CY
+    freqs.IL-LIBYA.csv -> IL-LIBYA
+    freqs.US-NAFR.cav -> US-NAFR
+    """
+    name = p.name
+    if not name.startswith("freqs."):
+        raise ValueError(f"Unexpected file (must start with freqs.): {name}")
+    key = name[len("freqs.") :]
+    key = re.sub(r"\.[^.]+$", "", key)  # strip last extension
+    return key
 
 
-def plot_nmf(nmf1,name_list,clustered=True):
-    # plot W to visualize the resutls
-    W=nmf1['W']
-    H=nmf1['H']
-    width = 0.8    # the width of the bars: can also be len(x) sequence
-    N_Bars=H.shape[1]
-    ind = np.arange(N_Bars)    # the x locations for the groups
-    kmeans = KMeans(n_clusters=H.shape[0]).fit(H.transpose()) 
-    H1=H
-    ordered_list=name_list # I keep this array of names and then will update the order if needed
-    if (clustered):
-        labels=kmeans.labels_ 
-        order=np.argsort(labels)
-        H1=H1[:,order]
-        ordered_list = [name_list[i] for i in order]
-    for col in range(H.shape[1]):
-        H1[:,col]=H1[:,col]/sum(H1[:,col])
-        H1[:,col]=np.cumsum(H1[:,col])
-    figure(num=None, figsize=(16, 10), dpi=80, facecolor='w', edgecolor='k')
+def read_freq_file(path: Path, use: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
 
-    for row in reversed(range(H.shape[0])):
-        plt.barh(ind, H1[row,:], edgecolor='white')
-    plt.yticks(np.arange(H.shape[1]), ordered_list) # add ticks to plot
-    # Custom x axis
-    #plt.xticks(r, names)
-    plt.ylabel("Populations")
- 
-    # Show graphic
-    plt.show()
+    needed = {"Haplo", use}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"{path}: missing columns {sorted(missing)}")
 
-def save_nmf(nmf1,name_list,f_output):
-    # save only W as CSV
-    W=nmf1['W']
-    H=nmf1['H']
-    H1=H
-    ordered_list=name_list # I keep this array of names and then will update the order if needed
-    for col in range(H.shape[1]):
-        H1[:,col]=H1[:,col]/sum(H1[:,col])
-    np.savetxt(f_output, H1, delimiter=',')
+    out = df[["Haplo", use]].copy()
+    out[use] = pd.to_numeric(out[use], errors="coerce").fillna(0.0)
+    out = out[out[use] > 0].copy()
+    return out
 
 
-# In[55]:
+def build_matrix(
+    freqs_dir: Path,
+    use: str = "Freq",
+    min_value: float = 0.0,
+    renormalize_rows: bool = True,
+) -> Tuple[np.ndarray, List[str], List[str]]:
+    """
+    Returns X (n_pops x n_haplos), pop_keys, haplo_cols
+    """
+    files = sorted([p for p in freqs_dir.iterdir() if p.is_file() and p.name.startswith("freqs.")])
+    if not files:
+        raise ValueError(f"No freqs.* files found in {freqs_dir}")
+
+    pop_keys: List[str] = []
+    haplo_to_col: Dict[str, int] = {}
+    rows_as_dicts: List[Dict[int, float]] = []
+
+    # First pass: gather values and build haplotype index on the fly
+    for f in files:
+        key = parse_key_from_filename(f)
+        df = read_freq_file(f, use=use)
+
+        if min_value > 0:
+            df = df[df[use] >= min_value].copy()
+
+        pop_keys.append(key)
+        row: Dict[int, float] = {}
+
+        for hap, val in zip(df["Haplo"].astype(str), df[use].astype(float)):
+            col = haplo_to_col.get(hap)
+            if col is None:
+                col = len(haplo_to_col)
+                haplo_to_col[hap] = col
+            row[col] = row.get(col, 0.0) + float(val)
+
+        rows_as_dicts.append(row)
+
+    n_pops = len(pop_keys)
+    n_haplos = len(haplo_to_col)
+    X = np.zeros((n_pops, n_haplos), dtype=float)
+
+    for i, row in enumerate(rows_as_dicts):
+        for j, v in row.items():
+            X[i, j] = v
+
+    # Renormalize each population row to sum to 1 (recommended when using Freq,
+    # and still useful when using Count after filtering)
+    if renormalize_rows:
+        row_sums = X.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        X = X / row_sums
+
+    # Preserve haplotype column order by creation index
+    haplo_cols = [""] * n_haplos
+    for hap, j in haplo_to_col.items():
+        haplo_cols[j] = hap
+
+    return X, pop_keys, haplo_cols
 
 
-with open(fname_pop_names, 'rt') as f:
-    reader = csv.reader(f)
-    name_list = list(reader)
-name_list1 = [val for sublist in name_list for val in sublist]
+def run_nmf(
+    X: np.ndarray,
+    k: int,
+    random_state: int = 1,
+    max_iter: int = 2000,
+    alpha_W: float = 0.0,
+    alpha_H: float = 0.0,
+    l1_ratio: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns W, H with nonnegative entries.
+    """
+    model = NMF(
+        n_components=k,
+        init="nndsvdar",
+        solver="mu",
+        beta_loss="frobenius",
+        max_iter=max_iter,
+        random_state=random_state,
+        alpha_W=alpha_W,
+        alpha_H=alpha_H,
+        l1_ratio=l1_ratio,
+    )
+    W = model.fit_transform(X)         # (n_pops x k)
+    H = model.components_              # (k x n_haplos)
 
-haplotype_freq=genfromtxt(fname, delimiter=',')
-Num_Comp=8
+    # Convert W rows to proportions (sum to 1)
+    W = normalize(W, norm="l1", axis=1)
+
+    # Convert H rows to proportions (sum to 1) so each component is a “population profile”
+    H = normalize(H, norm="l1", axis=1)
+
+    return W, H
 
 
-# In[58]:
+def write_outputs(
+    out_dir: Path,
+    W: np.ndarray,
+    H: np.ndarray,
+    pop_keys: List[str],
+    haplo_cols: List[str],
+    top_n: int = 25,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    k = W.shape[1]
+    comp_cols = [f"K{i+1}" for i in range(k)]
+
+    W_df = pd.DataFrame(W, index=pop_keys, columns=comp_cols)
+    W_df.index.name = "population"
+    W_df.to_csv(out_dir / "W.populations_by_K.csv")
+
+    H_df = pd.DataFrame(H, index=comp_cols, columns=haplo_cols)
+    H_df.index.name = "component"
+    H_df.to_csv(out_dir / "H.K_by_haplotypes.csv")
+
+    # Top haplotypes per component
+    rows = []
+    for ci, cname in enumerate(comp_cols):
+        weights = H[ci, :]
+        top_idx = np.argsort(weights)[::-1][:top_n]
+        for rank, j in enumerate(top_idx, start=1):
+            rows.append(
+                {
+                    "component": cname,
+                    "rank": rank,
+                    "haplo": haplo_cols[j],
+                    "weight": float(weights[j]),
+                }
+            )
+    pd.DataFrame(rows).to_csv(out_dir / "components.top_haplotypes.csv", index=False)
+
+    with open(out_dir / "matrix.X.shape.txt", "w", encoding="utf-8") as f:
+        f.write(f"X shape: {len(pop_keys)} populations x {len(haplo_cols)} haplotypes\n")
 
 
-nmf1=nmf_comp(Num_Comp,haplotype_freq,norm_method=3,comp_method='NMF')
-save_nmf(nmf1,name_list,outfile)
-plot_nmf(nmf1,name_list1,clustered=True)
+def main():
+    ap = argparse.ArgumentParser(description="Run NMF on freqs.*.csv haplotype frequency files")
+    ap.add_argument("freqs_dir", help="Directory with freqs.* files")
+    ap.add_argument("-k", "--components", type=int, required=True, help="Number of NMF components (K)")
+    ap.add_argument("--use", choices=["Freq", "Count"], default="Freq", help="Use Freq or Count as input values")
+    ap.add_argument("--min-value", type=float, default=0.0, help="Drop haplotypes below this value before building X")
+    ap.add_argument("--no-renorm-rows", action="store_true", help="Do NOT renormalize rows to sum to 1")
+    ap.add_argument("--out-dir", default="nmf_out", help="Output directory")
+    ap.add_argument("--seed", type=int, default=1, help="Random seed")
+    ap.add_argument("--max-iter", type=int, default=2000, help="Max iterations")
+    ap.add_argument("--top-n", type=int, default=25, help="Top haplotypes per component to export")
+
+    # Optional regularization knobs (leave at 0 unless you want sparser factors)
+    ap.add_argument("--alpha-w", type=float, default=0.0, help="Regularization strength for W")
+    ap.add_argument("--alpha-h", type=float, default=0.0, help="Regularization strength for H")
+    ap.add_argument("--l1-ratio", type=float, default=0.0, help="0=L2, 1=L1 mix for regularization")
+
+    args = ap.parse_args()
+
+    freqs_dir = Path(args.freqs_dir)
+    out_dir = Path(args.out_dir)
+
+    X, pop_keys, haplo_cols = build_matrix(
+        freqs_dir=freqs_dir,
+        use=args.use,
+        min_value=args.min_value,
+        renormalize_rows=not args.no_renorm_rows,
+    )
+
+    W, H = run_nmf(
+        X=X,
+        k=args.components,
+        random_state=args.seed,
+        max_iter=args.max_iter,
+        alpha_W=args.alpha_w,
+        alpha_H=args.alpha_h,
+        l1_ratio=args.l1_ratio,
+    )
+
+    write_outputs(out_dir, W, H, pop_keys, haplo_cols, top_n=args.top_n)
+    print(f"Wrote outputs to: {out_dir.resolve()}")
 
 
-# In[59]:
-
-
-plot_nmf(nmf1,name_list1,clustered=True)
+if __name__ == "__main__":
+    main()
 
